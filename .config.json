@@ -1,0 +1,5 @@
+{
+    "cpanel_user": "your_cpanel_user",
+    "cpanel_token": "your_cpanel_token",
+    "cpanel_host": "your_cpanel_host"
+}

@@ -1,0 +1,163 @@
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Uptime Monitor</title>
+</head>
+
+<body>
+    <style>
+        html {
+            background: transparent;
+            color: white;
+            font-family: monospace;
+            font-size: 20px;
+        }
+
+html {
+  background-color: transparent !important;
+}
+
+        body {
+            display: block;
+            margin: auto;
+            padding-top: 1em;
+            display: flex;
+            flex-direction: column;
+            gap: .5em;
+            padding: .5em;
+        }
+
+        input,
+        button {
+            font-family: monospace;
+            font-size: 1em;
+            padding: .5em;
+            border-radius: 8px;
+            border: none;
+            display:none;
+
+        }
+
+        button {
+            background: #4AF;
+            color: white;
+            cursor: pointer;
+        }
+
+        .blocks {
+            display: flex;
+            gap: 2px;
+            padding: 2px;
+        }
+
+        .block {
+            width: 4px;
+            border-radius: 2px;
+            height: 1.4em;
+        }
+
+        table {
+            width: 100%;
+            table-layout: fixed;
+            border-collapse: collapse;
+            display:none;
+        }
+
+        table td {
+            border: 1px solid #8882;
+            padding: .4em
+        }
+    </style>
+    <script>
+        // Monitoring
+
+        var urlInput = document.createElement("input");
+        urlInput.setAttribute("type", "text");
+        urlInput.setAttribute("placeholder", "url");
+        urlInput.value = "https://topluyo.com/ping.php";
+
+        var button = document.createElement("button");
+        button.innerHTML = "start";
+        button.onclick = start;
+
+        var blocks = document.createElement("div");
+        blocks.classList.add("blocks")
+
+
+        let url = "http://topluyo.com/ping.php"
+
+        var table = document.createElement("table");
+        table.innerHTML += "<tr><td>status</td><td>time</td><td>url</td></tr>"
+
+        document.body.appendChild(urlInput);
+        document.body.appendChild(button);
+        document.body.append(blocks)
+
+        document.body.appendChild(table);
+
+
+
+        function jsonp(url) {
+            return new Promise((res, rej) => {
+                let start = Date.now()
+                let script = document.createElement("script")
+                script.src = url
+                document.body.appendChild(script)
+                script.onload = function () {
+                    let end = Date.now()
+                    let time = end - start
+                    res(time)
+                }
+                script.onerror = function () {
+                    let end = Date.now()
+                    let time = end - start
+                    rej(time)
+                }
+            })
+        }
+
+        function test() {
+            if (urlInput.value != "") {
+                let url = urlInput.value;
+                // test url
+                if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                    url = "http://" + url
+                }
+                //url = url + "/?" + parseInt(Math.random() * 100000000)
+                jsonp(url).then((time) => {
+                    // table.innerHTML = `<tr><td style="color:green">online</td><td>${time}ms</td><td>${url}</td></tr>` + table.innerHTML;
+                    let block = document.createElement("div")
+                    block.classList.add("block")
+                    block.style.background = "#4F4"
+                    block.setAttribute("title", (new Date()).toString())
+                    blocks.append(block)
+                    if (blocks.children.length > 200) { blocks.removeChild(blocks.firstElementChild) }
+                }).catch((time) => {
+                    table.innerHTML =
+                        `<tr><td style="color:red">offline</td><td>${time}ms</td><td>${url}</td></tr>` + table
+                        .innerHTML;
+                    let block = document.createElement("div")
+                    block.classList.add("block")
+                    block.style.background = "#F44"
+                    if (blocks.children.length > 200) { blocks.removeChild(blocks.firstElementChild) }
+                    blocks.append(block)
+                })
+            }
+        }
+
+        function start() {
+            setInterval(() => {
+                test()
+            }, 10000);
+        }
+        test()
+        start();
+    </script>
+</body>
+
+</html>
