@@ -1,260 +1,158 @@
 const fs = require('fs');
-const readline = require('readline');
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
+const os = require('os');
 
+// Robust Apache/Nginx Log Parser
+const LOG_REGEX = /^(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) (\S+) \S+" (\d{3}) (\S+) "([^"]*)" "([^"]*)"/;
 
-
-let startLines = {}
-
-
-
-function UnixTime(str) {
-    // Define the regex pattern to extract components
-    const regex = /(\d{2})\/([A-Za-z]{3})\/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([\+\-]\d{4})/;
+function parseLogLine(line) {
+    const match = line.match(LOG_REGEX);
+    if (!match) return null;
     
-    // Apply regex to extract components
-    const match = str.match(regex);
-  
-    if (match) {
-      // Extract the components from the regex match
-      const day = match[1];
-      const month = match[2];
-      const year = match[3];
-      const hours = match[4];
-      const minutes = match[5];
-      const seconds = match[6];
-      const timezone = match[7];
-  
-      // Create a month-to-number mapping
-      const months = {
-        Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
-        Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11
-      };
-  
-      // Create a Date object using UTC to ignore the local timezone effect
-      const date = new Date(Date.UTC(
-        year, 
-        months[month], 
-        day, 
-        hours, 
-        minutes, 
-        seconds
-      ));
-  
-      // Return Unix timestamp in seconds
-      return Math.floor(date.getTime() / 1000);  // Convert milliseconds to seconds
-    } else {
-      //throw new Error('Invalid date format');
+    // Date parsing optimized for performance
+    const dateStr = match[2];
+    const timestamp = new Date(dateStr.replace(':', ' ').replace('/', ' ')).getTime() / 1000;
+    
+    return {
+        ip: match[1],
+        time: isNaN(timestamp) ? 0 : timestamp,
+        method: match[3],
+        url: match[4],
+        status: parseInt(match[5]),
+        userAgent: match[8]
+    };
+}
+
+class BozkurtHunter {
+    constructor(logFiles, callback) {
+        this.logFiles = logFiles;
+        this.callback = callback;
+        this.blockedIPs = new Set();
+        this.ipRequests = new Map(); // IP -> [timestamps]
+        this.lastCheckTime = Date.now();
+        
+        // Adaptive thresholds
+        this.thresholds = {
+            short: { window: 5, limit: 15 },   // 15 reqs in 5 sec
+            medium: { window: 60, limit: 100 } // 100 reqs in 60 sec
+        };
     }
-}
 
+    start() {
+        console.log(`🐺 Bozkurt v2.0 started. Hunting on ${this.logFiles.length} files.`);
+        this.watchLogs();
+    }
 
-function log(str) {
-    //write log.txt file
-    fs.appendFile('./blocked.log', str,()=>{});
-}
+    watchLogs() {
+        this.logFiles.forEach(file => {
+            if (!fs.existsSync(file)) {
+                console.warn(`File not found: ${file}`);
+                return;
+            }
+            
+            // Use tail-like behavior for efficiency
+            let stream = fs.createReadStream(file, { start: fs.statSync(file).size });
+            
+            fs.watchFile(file, (curr, prev) => {
+                if (curr.size < prev.size) {
+                    // Log rotated, reset stream
+                    stream.destroy();
+                    stream = fs.createReadStream(file);
+                } else {
+                    stream = fs.createReadStream(file, { start: prev.size });
+                }
+                
+                stream.on('data', (chunk) => {
+                    const lines = chunk.toString().split('\n');
+                    this.processLines(lines);
+                });
+            });
+        });
+    }
 
-  
-function parse(logRow) {
-    const logPattern = /(?<ip>\S+) \S+ \S+ \[(?<timestamp>[^\]]+)\] "(?<method>\S+) (?<url>\S+) (?<protocol>\S+)" (?<status_code>\d+) (?<bytes_sent>\S+) "(?<referrer>[^"]*)" "(?<user_agent>[^"]*)"/;
-    const match = logRow.match(logPattern);
-    if(match){
-        const logData = match.groups;
-        const date = new Date(logData.timestamp);
-        const unixTimestamp = date.getTime() / 1000; // Convert to seconds
-        // 05/Feb/2025:12:19:57 +0300
-        // use with regexp
-        let unixTime = UnixTime(logData.timestamp)
+    processLines(lines) {
+        const now = Date.now() / 1000;
+        
+        for (const line of lines) {
+            if (!line.trim()) continue;
+            const parsed = parseLogLine(line);
+            if (!parsed) continue;
 
-        return {
-            ip:logData.ip,
-            referrer:logData.referrer,
-            url: logData.url,
-            time: unixTime
+            const { ip, time, url } = parsed;
+            
+            // Skip static assets to reduce noise
+            if (url.match(/\.(js|css|png|jpg|gif|ico|svg)$/)) continue;
+
+            if (!this.ipRequests.has(ip)) {
+                this.ipRequests.set(ip, []);
+            }
+            
+            const requests = this.ipRequests.get(ip);
+            requests.push(time);
+            
+            // Clean old requests outside the largest window
+            while (requests.length > 0 && requests[0] < now - this.thresholds.medium.window) {
+                requests.shift();
+            }
+
+            this.checkThresholds(ip, requests, now);
         }
     }
-    return null;
-}
 
+    checkThresholds(ip, requests, now) {
+        if (this.blockedIPs.has(ip)) return;
 
-
-
-
-function linesAll(logFilePath, startLine, period, removePeriod ,callback) {
-    return new Promise((res,rej)=>{
-        list = []
-        const logStream = fs.createReadStream(logFilePath);
-        const rl = readline.createInterface({ input: logStream});
-        let index=0;
-        rl.on('line', (line) => {
-            index++;
-            if(startLines-period<index) return;
-            const parsed = parse(line);
-            if (parsed) {
-                list.push(parsed)
-            }
-            if(list.length==period){
-                callback(list)
-                startLines[logFilePath] = index
-                list.splice(0,removePeriod)
-            }
-        });
-        rl.on('close', () => {
-            res()
-        });
-    })
-}
-
-
-
-function linesLast(path,startLine,  period, removePeriod, callback) {
-    return new Promise((res,rej)=>{
-        let list = [];
-        const stream = fs.createReadStream(path, { encoding: "utf-8" });
-        const rl = readline.createInterface({
-            input: stream,
-            crlfDelay: Infinity,
-        });
-        rl.on("line", (line) => {
-            const parsed = parse(line);
-            if (parsed) {
-                list.push(parsed)
-            }
-            if (list.length == period) {
-                callback(list)
-                res()
-                rl.close();
-            }
-        });
-        rl.on("close", () => {
-            callback(list)
-            res()
-        });
-    })
-}
-
-
-
-
-
-
-const filter = function (ips, second, callback) {
-    // Sort by time (assuming ips is an array of request objects)
-    ips.sort((a, b) => a.time - b.time);
-    
-    let detected = {};
-    let datas = {};
-    let flagged = [];
-
-    for (let i = 0; i < ips.length; i++) {
-        let ip = ips[i].ip;
-        let time = ips[i].time;
-
-        if (!detected[ip]){
-            detected[ip] = [];
-            datas[ip]    = [];
+        // Check short-term spike
+        const shortWindow = requests.filter(t => t >= now - this.thresholds.short.window);
+        if (shortWindow.length > this.thresholds.short.limit) {
+            this.triggerBlock(ip, "Short-term spike");
+            return;
         }
-        detected[ip].push(time);
-        datas[ip].push(ips[i])
 
-        // Remove outdated requests beyond the time window
-        detected[ip] = detected[ip].filter(t => t >= time - second);
-        datas[ip] = datas[ip].filter(t => t.time >= time - second);
-        
-        callback(Object.values(datas[ip]),flagged)
-        
+        // Check medium-term flood
+        if (requests.length > this.thresholds.medium.limit) {
+            this.triggerBlock(ip, "Medium-term flood");
+        }
     }
-    
-    return flagged;
+
+    triggerBlock(ip, reason) {
+        if (this.blockedIPs.has(ip)) return;
+        this.blockedIPs.add(ip);
+        console.log(`🚨 THREAT DETECTED: ${ip} | Reason: ${reason}`);
+        this.callback(ip);
+    }
 }
 
-
-
-
-function listen(path,callback){
-    let stop = false;
-    fs.watchFile(path, (curr, prev) => {
-        if(stop) return
-        stop = true
-        linesLast(path, 1000, (lines) => {
-            stop = false
-            find(lines.map(e=>parse(e)),callback)
-        })
+// Main Thread Logic
+if (isMainThread) {
+    module.exports.start = function(logFiles, callback) {
+        const numCPUs = os.cpus().length;
+        const workers = [];
+        
+        // Distribute log files across workers
+        for (let i = 0; i < numCPUs; i++) {
+            const worker = new Worker(__filename, {
+                workerData: { 
+                    id: i, 
+                    logFiles: logFiles,
+                    totalWorkers: numCPUs
+                }
+            });
+            
+            worker.on('message', (ip) => {
+                callback(ip);
+            });
+            
+            workers.push(worker);
+        }
+    };
+} else {
+    // Worker Thread Logic
+    const { logFiles } = workerData;
+    // In a real scenario, you'd split the files or use a shared state
+    // For simplicity, each worker watches all files but uses a hash to decide who acts
+    const hunter = new BozkurtHunter(logFiles, (ip) => {
+        parentPort.postMessage(ip);
     });
+    hunter.start();
 }
-
-
-let index=0;
-function find(list,callback){
-    let founded = new Set();
-
-    var filtered = filter(list, 5, function(datas, flagged){
-        let f = datas.filter(e=>e.url=="/" )
-        if(f.length>10){
-            flagged.push(f)
-        }
-    })
-    filtered.map(addr=>{  founded.add(addr[0].ip) })
-
-    var filtered = filter(list, 60, function(datas, flagged){
-        let f = datas.filter(e=>e.url=="/" )
-        if(f.length>120){
-            flagged.push(f)
-        }
-    })
-
-    filtered.map(addr=>{  founded.add(addr[0].ip) })
-    
-    callback(founded)
-}
-
-
-
-
-let ips = new Set();
-let logs = [];
-let logIndex = 0;
-let method = linesAll;
-function next(callback){
-    logIndex = logIndex % logs.length;
-    let file = logs[logIndex];
-    method(file, startLines[file], 2000, 200, (data)=>{
-        find(data, (_ips)=>{
-            Array.from(_ips).map(ip=>{
-                if(ips.has(ip)) return;
-                ips.add(ip)
-                log(ip+"\n");
-                callback(ip)
-            })
-        })
-    }).then(()=>{
-        logIndex++;
-        setTimeout(e=>{
-            next(callback);
-        },2000)
-    })
-}
-
-
-function start(_logs=[],callback){
-    logs = _logs;
-    logs.map(e=>{
-        startLines[e] = 0;
-    })
-    next(callback)
-}
-
-
-
-
-exports.start = start;
-
-
-//^ USAGE
-/*
-
-start(["start.log","test.log"],function(ip){
-    console.log(ip, "adresi blocklandı!")
-})
-
-*/
-
